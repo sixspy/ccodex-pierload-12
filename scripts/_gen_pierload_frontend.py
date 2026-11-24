@@ -211,6 +211,12 @@ textarea { min-height: 80px; font-family: var(--font-mono); font-size: 12px; }
 input:focus, select:focus, textarea:focus {
   outline: 1px solid var(--amber); outline-offset: 1px;
 }
+
+/* 对账页辅助：偏差行高亮 */
+.recon-warn { color: var(--warn); font-weight: 600; }
+.recon-ok { color: var(--ok); }
+.table-wrap { overflow-x: auto; max-width: 100%; }
+.harbor-main .panel + .panel { margin-top: 14px; }
 """
 
 DASH = r"""
@@ -223,12 +229,14 @@ export const dashboardViewTemplate = `
     <div class="hero-card"><span class="t">开放超重</span><div class="n">{{ dash.open_overloads ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">旁路挂起</span><div class="n">{{ dash.side_pending ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">过磅票</span><div class="n">{{ dash.tickets ?? '—' }}</div></div>
-    <div class="hero-card"><span class="t">已放行</span><div class="n">{{ dash.gate_releases ?? '—' }}</div></div>
+    <div class="hero-card"><span class="t">已放行（正式）</span><div class="n">{{ dash.gate_releases ?? '—' }}</div></div>
+    <div class="hero-card"><span class="t">放行偏航</span><div class="n">{{ dash.gate_release_anomalies ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">已封闸</span><div class="n">{{ dash.gate_seals ?? '—' }}</div></div>
   </div>
   <p class="hint" style="margin-top:16px">骨架：{{ dash.meta && dash.meta.skeleton }}</p>
 </section>
-`;"""
+`;
+"""
 
 BRIDGES = r"""
 export const bridgesViewTemplate = `
@@ -267,11 +275,10 @@ export const bridgesViewTemplate = `
 </section>
 `;"""
 
-TICKETS = r"""
-export const ticketsViewTemplate = `
+TICKETS = r"""export const ticketsViewTemplate = `
 <section class="panel">
   <h2>过磅票采集</h2>
-  <p class="hint">录入各轴重 JSON；超重自动旁路挂起并开超重记录。</p>
+  <p class="hint">录入各轴重 JSON；超重自动旁路挂起。“可放行”一列与放行页同源，按岸桥计划泊位行核。</p>
   <div class="form-row">
     <div><label>车道</label>
       <select v-model.number="ticketForm.lane_id">
@@ -293,14 +300,20 @@ export const ticketsViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>票号</th><th>车道</th><th>提单</th><th>毛重</th><th>状态</th><th>代</th><th></th></tr></thead>
+    <thead><tr><th>票号</th><th>车道</th><th>提单</th><th>毛重</th><th>状态</th><th>岸桥泊位</th><th>可放行</th><th>代</th><th></th></tr></thead>
     <tbody>
       <tr v-for="t in tickets" :key="t.id" @click="selectTicket(t)">
         <td>{{ t.ticket_code }}</td>
         <td>{{ t.lane_code }}</td>
         <td>{{ t.bl_ref }}</td>
         <td>{{ fmtT(t.gross_t) }}</td>
-        <td><span class="badge" :class="ticketClass(t.status)">{{ t.status }}</span></td>
+        <td><span class="badge" :class="ticketClass(t.display_status || t.status)">{{ t.display_status || t.status }}</span></td>
+        <td>{{ t.crane_plan_ready ? (t.crane_berth_slot || '有') : '无计划' }}</td>
+        <td>
+          <span class="badge" :class="t.releasable ? 'pass' : (t.release_state === '偏航未晋升' ? 'fail' : 'muted')">
+            {{ t.release_state }}
+          </span>
+        </td>
         <td>{{ t.generation }}</td>
         <td><button class="mini-btn" @click.stop="loadTicketDetail(t.id)">详情</button></td>
       </tr>
@@ -308,6 +321,10 @@ export const ticketsViewTemplate = `
   </table>
   <div v-if="ticketDetail" class="detail-box">
     <p>车牌 {{ ticketDetail.ticket.vehicle_plate }} · 超重挂起 {{ ticketDetail.overload_holds.length }} 条</p>
+    <p v-if="ticketDetail.release_state">
+      放行口径 {{ ticketDetail.release_state.release_state }} · 岸桥泊位
+      {{ ticketDetail.release_state.crane_berth_slot || '无计划' }}
+    </p>
   </div>
 </section>
 `;"""
@@ -351,11 +368,11 @@ GATE = r"""
 export const gateViewTemplate = `
 <section class="panel">
   <h2>闸口放行</h2>
-  <p class="hint">须票态已裁定且无开放超重挂起；旁路未闭环不得抬杆。</p>
+  <p class="hint">岸桥禁放第12号：须票态已裁定、无开放超重、且岸桥计划有匹配泊位行；缺泊位行则由放行写口原子拒收，正式册零增。</p>
   <div class="form-row">
-    <div><label>过磅票</label>
+    <div><label>过磅票（仅泊位计划齐套）</label>
       <select v-model.number="gateForm.ticket_id">
-        <option v-for="t in releasableTickets" :key="t.id" :value="t.id">{{ t.ticket_code }}</option>
+        <option v-for="t in releasableTickets" :key="t.id" :value="t.id">{{ t.ticket_code }} · {{ t.crane_berth_slot }}</option>
       </select>
     </div>
     <div><label>值班员</label><input v-model="gateForm.officer"/></div>
@@ -364,20 +381,32 @@ export const gateViewTemplate = `
     <button @click="releaseGate">确认放行</button>
     <button class="secondary" @click="refresh">刷新</button>
   </div>
+  <p v-if="!releasableTickets.length" class="hint">无可抬杆票：岸桥计划泊位行未齐套的票一律禁放。</p>
+  <p v-if="blockedReleases.length" class="hint">
+    禁放/待补 {{ blockedReleases.length }} 票：
+    <span v-for="b in blockedReleases" :key="b.id" class="badge fail" style="margin-right:6px">{{ b.ticket_code }} · {{ b.release_state }}</span>
+  </p>
   <table class="data-table">
-    <thead><tr><th>放行号</th><th>票号</th><th>车道</th><th>值班员</th><th>时间</th></tr></thead>
+    <thead><tr><th>放行号</th><th>票号</th><th>车道</th><th>泊位</th><th>值班员</th><th>册别</th><th>时间</th></tr></thead>
     <tbody>
       <tr v-for="g in gateReleases" :key="g.id">
         <td>{{ g.release_ref }}</td>
         <td>{{ g.ticket_code }}</td>
         <td>{{ g.lane_code }}</td>
+        <td>{{ g.crane_berth_slot || '—' }}</td>
         <td>{{ g.officer }}</td>
+        <td>
+          <span class="badge" :class="g.release_register === '正式' ? 'pass' : 'fail'">
+            {{ g.release_register }} · {{ g.release_state }}
+          </span>
+        </td>
         <td>{{ g.released_at }}</td>
       </tr>
     </tbody>
   </table>
 </section>
-`;"""
+`;
+"""
 
 SEAL = r"""
 export const sealViewTemplate = `
@@ -484,7 +513,7 @@ export const reconcileViewTemplate = `
 <section class="grid-2">
   <section class="panel">
     <h2>提单对账</h2>
-    <p class="hint">汇总过磅毛重与提单申报吨比对。</p>
+    <p class="hint">汇总过磅毛重与提单申报吨比对；放行口径取岸桥计划晋升结果，偏航行不得计为已放行。</p>
     <div class="form-row">
       <div><label>提单号</label><input v-model="reconCode"/></div>
     </div>
@@ -495,25 +524,45 @@ export const reconcileViewTemplate = `
     <div v-if="reconOne" class="detail-box">
       <p>申报 {{ reconOne.declared_gross_t }}t · 过磅合计 {{ reconOne.ticket_sum_t }}t</p>
       <p :class="reconOne.balanced ? 'ok' : 'bad'">{{ reconOne.balanced ? '账实平衡' : '偏差待查' }}</p>
-      <p>快照数 {{ reconOne.seal_count }} · 可出证明 {{ reconOne.proof_ready ? '是' : '否' }}</p>
+      <p>快照数 {{ reconOne.seal_count }} · 有据放行 {{ reconOne.released_count ?? 0 }} · 偏航 {{ reconOne.unpromoted_count ?? 0 }}</p>
+      <p>可出证明 {{ reconOne.proof_ready ? '是' : '否' }}</p>
+      <table class="data-table compact" style="margin-top:8px">
+        <thead><tr><th>票号</th><th>岸桥泊位</th><th>放行口径</th></tr></thead>
+        <tbody>
+          <tr v-for="t in reconOne.tickets" :key="t.ticket_code">
+            <td>{{ t.ticket_code }}</td>
+            <td>{{ t.crane_plan_ready ? (t.crane_berth_slot || '有') : '无计划' }}</td>
+            <td>
+              <span class="badge" :class="t.released ? 'pass' : (t.release_ref ? 'fail' : 'muted')">
+                {{ t.release_state || (t.crane_plan_ready ? '待放行' : '禁放') }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
     <ul v-if="reconAllItems.length">
-      <li v-for="r in reconAllItems" :key="r.bl_code">{{ r.bl_code }} · {{ r.balanced ? '平' : '偏' }}</li>
+      <li v-for="r in reconAllItems" :key="r.bl_code">{{ r.bl_code }} · {{ r.balanced ? '平' : '偏' }}<span v-if="r.unpromoted_count" class="recon-warn"> · 偏航 {{ r.unpromoted_count }}</span></li>
     </ul>
   </section>
   <section class="panel">
     <h2>单票证明</h2>
     <div class="form-row"><div><label>票号</label><input v-model="proofCode"/></div></div>
-    <motion class="actions"><button @click="loadProof">拉证明</button></motion>
+    <div class="actions"><button @click="loadProof">拉证明</button></div>
     <div v-if="proofOne" class="detail-box">
       <p>提单匹配 {{ proofOne.manifest_matches_bl ? '是' : '否' }}</p>
       <p>超重闭环 {{ proofOne.overload_closed ? '是' : '否' }}</p>
-      <p>已放行 {{ proofOne.released ? '是' : '否' }}</p>
+      <p>岸桥计划 {{ proofOne.crane_plan_ready ? ('齐套 · ' + (proofOne.crane_berth_slot || '')) : '无泊位行' }}</p>
+      <p :class="proofOne.release_register === '偏航' ? 'recon-warn' : ''">
+        已放行 {{ proofOne.released ? '是' : '否' }} · {{ proofOne.release_state }}
+        <span v-if="proofOne.release_ref">（{{ proofOne.release_ref }}）</span>
+      </p>
       <p>一致 {{ proofOne.coherent ? '是' : '否' }}</p>
     </div>
   </section>
 </section>
-`;"""
+`;
+"""
 
 STUBS = r"""
 export const stubsViewTemplate = `
@@ -532,17 +581,40 @@ export const stubsViewTemplate = `
   </section>
   <section class="panel">
     <h2>岸桥计划空桩</h2>
+    <p class="hint">挂票即生成泊位行；本页须与放行页、对账页同源——岸桥页空而别处已放行即为偏航。</p>
     <div class="form-row">
       <div><label>泊位</label><input v-model="craneForm.berth_slot"/></div>
       <div><label>票ID(可空)</label><input v-model.number="craneForm.ticket_id" type="number"/></div>
     </div>
     <div class="actions"><button @click="enqueueCrane">入队</button></div>
+    <p v-if="craneUnplanned.length" class="hint recon-warn">
+      偏航 {{ craneUnplanned.length }} 条：无岸桥计划却已出正式放行（岸桥禁放第12号）。
+    </p>
     <table class="data-table compact">
-      <tr v-for="j in craneJobs" :key="j.id"><td>{{ j.berth_slot }}</td><td>{{ j.status }}</td></tr>
+      <thead><tr><th>泊位</th><th>票号</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr v-for="j in craneJobs" :key="j.id">
+          <td>{{ j.berth_slot }}</td>
+          <td>{{ j.ticket_code || '—' }}</td>
+          <td><span class="badge" :class="j.crane_plan_ready ? 'pass' : 'muted'">{{ j.status }}</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <table v-if="craneUnplanned.length" class="data-table compact" style="margin-top:10px">
+      <thead><tr><th>偏航放行号</th><th>票号</th><th>车道</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr v-for="o in craneUnplanned" :key="o.id">
+          <td>{{ o.release_ref }}</td>
+          <td>{{ o.ticket_code }}</td>
+          <td>{{ o.lane_code }}</td>
+          <td class="recon-warn">{{ o.reason }}</td>
+        </tr>
+      </tbody>
     </table>
   </section>
 </section>
-`;"""
+`;
+"""
 
 API_JS = r"""
 export function createApi(getToken, onUnauthorized) {
@@ -576,6 +648,7 @@ export function createApi(getToken, onUnauthorized) {
     openOverload: (d) => req("/api/overloads/open", { method: "POST", body: JSON.stringify(d) }),
     closeOverload: (d) => req("/api/overloads/close", { method: "POST", body: JSON.stringify(d) }),
     gateReleases: () => req("/api/gate/releases"),
+    gateReleasable: () => req("/api/gate/releasable"),
     releaseGate: (d) => req("/api/gate/release", { method: "POST", body: JSON.stringify(d) }),
     seals: () => req("/api/seals"),
     createSeal: (d) => req("/api/seals", { method: "POST", body: JSON.stringify(d) }),
@@ -589,14 +662,14 @@ export function createApi(getToken, onUnauthorized) {
     customsJobs: () => req("/api/customs/jobs"),
     customsStub: (d) => req("/api/customs-stub", { method: "POST", body: JSON.stringify(d) }),
     craneJobs: () => req("/api/crane/jobs"),
+    cranePlan: (ticketId) => req(`/api/crane/plan/${ticketId}`),
     craneStub: (d) => req("/api/crane-stub", { method: "POST", body: JSON.stringify(d) }),
     contention: () => req("/api/contention"),
   };
 }
 """
 
-APP_JS = r"""
-import { createApi } from "./api.js";
+APP_JS = r"""import { createApi } from "./api.js";
 import { dashboardViewTemplate } from "./views/dashboard_view.js";
 import { bridgesViewTemplate } from "./views/bridges_view.js";
 import { lanesViewTemplate } from "./views/lanes_view.js";
@@ -629,11 +702,14 @@ createApp({
     const tickets = ref([]);
     const overloads = ref([]);
     const gateReleases = ref([]);
+    const gateReleasable = ref([]);
+    const gateBlocked = ref([]);
     const seals = ref([]);
     const blList = ref([]);
     const lineageEdges = ref([]);
     const customsJobs = ref([]);
     const craneJobs = ref([]);
+    const craneUnplanned = ref([]);
     const bridgeDetail = ref(null);
     const ticketDetail = ref(null);
     const reconOne = ref(null);
@@ -678,8 +754,9 @@ createApp({
       tickets.value.filter((t) => t.status !== "作废" && t.status !== "已封闸")
     );
     const releasableTickets = computed(() =>
-      tickets.value.filter((t) => t.status === "已裁定")
+      gateReleasable.value
     );
+    const blockedReleases = computed(() => gateBlocked.value);
     const sealableTickets = computed(() =>
       tickets.value.filter((t) => ["已裁定","已放行"].includes(t.status))
     );
@@ -690,6 +767,7 @@ createApp({
     }
     function ticketClass(s) {
       if (!s) return "muted";
+      if (s.includes("偏航") || s.includes("禁放")) return "fail";
       if (s.includes("挂起")) return "fail";
       if (s.includes("放行") || s.includes("裁定")) return "pass";
       if (s.includes("封闸")) return "warn";
@@ -720,13 +798,13 @@ createApp({
       await refresh();
     }
 
-    async function refresh() {
+    async function refresh(keepFlash = false) {
       if (!token.value) return;
-      clearFlash();
+      if (!keepFlash) clearFlash();
       try {
-        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2] = await Promise.all([
+        const [d, br, ln, tk, ov, gr, grq, sl, bl, lg, cj, cj2] = await Promise.all([
           api.dashboard(), api.bridges(), api.lanes(), api.tickets(), api.overloads(),
-          api.gateReleases(), api.seals(), api.blList(), api.lineage(),
+          api.gateReleases(), api.gateReleasable(), api.seals(), api.blList(), api.lineage(),
           api.customsJobs(), api.craneJobs(),
         ]);
         dash.value = d || {};
@@ -735,11 +813,14 @@ createApp({
         tickets.value = tk.items || [];
         overloads.value = ov.items || [];
         gateReleases.value = gr.items || [];
+        gateReleasable.value = grq.items || [];
+        gateBlocked.value = grq.blocked || [];
         seals.value = sl.items || [];
         blList.value = bl.items || [];
         lineageEdges.value = lg.items || [];
         customsJobs.value = cj.items || [];
         craneJobs.value = cj2.items || [];
+        craneUnplanned.value = cj2.unplanned_releases || [];
         if (bridges.value.length) {
           laneForm.value.bridge_id = laneForm.value.bridge_id || bridges.value[0].id;
         }
@@ -805,8 +886,10 @@ createApp({
       clearFlash();
       try {
         await api.releaseGate(gateForm.value);
-        flashOk("已放行"); await refresh();
-      } catch (e) { flashErr(e); }
+        flashOk("已放行（正式册）"); await refresh(true);
+      } catch (e) {
+        flashErr(e); await refresh(true);
+      }
     }
     async function createSeal() {
       clearFlash();
@@ -853,25 +936,20 @@ createApp({
       catch (e) { flashErr(e); }
     }
 
-    const viewMap = [
-      dashboardViewTemplate, bridgesViewTemplate, lanesViewTemplate, ticketsViewTemplate,
-      overloadViewTemplate, gateViewTemplate, sealViewTemplate, blViewTemplate,
-      lineageViewTemplate, reconcileViewTemplate, stubsViewTemplate,
-    ];
-
     onMounted(() => {
       if (token.value) refresh();
     });
 
     return {
       token, user, username, password, err, actionErr, actionOk, tab, nav,
-      dash, bridges, lanes, tickets, overloads, gateReleases, seals, blList,
-      lineageEdges, customsJobs, craneJobs, bridgeDetail, ticketDetail,
+      dash, bridges, lanes, tickets, overloads, gateReleases, gateReleasable, gateBlocked,
+      seals, blList, lineageEdges, customsJobs, craneJobs, craneUnplanned,
+      bridgeDetail, ticketDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       bridgeForm, laneForm, ticketForm, overloadOpenForm, gateForm, sealForm,
       blForm, lineageForm, customsForm, craneForm,
-      adjudicableTickets, releasableTickets, sealableTickets,
-      login, logout, refresh, viewMap,
+      adjudicableTickets, releasableTickets, blockedReleases, sealableTickets,
+      login, logout, refresh,
       fmtT, ticketClass, shortText,
       createBridge, loadBridgeDetail, createLane, createTicket, loadTicketDetail, selectTicket,
       openOverload, closeOverload, releaseGate, createSeal, registerBl, addLineage,
@@ -879,34 +957,34 @@ createApp({
     };
   },
   template: `
-    <motion v-if="!token" class="login-hero">
-      <UploadLogin class="login-card">
+    <div v-if="!token" class="login-hero">
+      <div class="login-card">
         <h1>港口过磅闸口</h1>
         <p class="sub">过磅票入闸后裁定超重才放行，驳回进旁路挂起，闸代快照与提单册对账。</p>
         <label>账号</label><input v-model="username"/>
         <label>密码</label><input v-model="password" type="password"/>
         <button @click="login">登录</button>
         <p v-if="err" class="err">{{ err }}</p>
-      </UploadLogin>
-    </motion>
-    <motion v-else class="harbor-shell">
+      </div>
+    </div>
+    <div v-else class="harbor-shell">
       <header class="harbor-top">
-        <motion style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;width:100%">
-          <motion>
+        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:16px;width:100%">
+          <div>
             <h1>港口过磅闸口</h1>
             <p class="tagline">数据工程 · 港区地磅闸口裁定</p>
-          </motion>
-          <motion class="stat-strip">
+          </div>
+          <div class="stat-strip">
             <span class="stat-pill">超重<strong>{{ dash.open_overloads ?? 0 }}</strong></span>
             <span class="stat-pill">旁路<strong>{{ dash.side_pending ?? 0 }}</strong></span>
             <span class="stat-pill">在港票<strong>{{ dash.tickets ?? 0 }}</strong></span>
-          </motion>
-          <motion class="top-actions">
+          </div>
+          <div class="top-actions">
             <span>{{ user }}</span>
             <button @click="refresh">刷新</button>
             <button @click="logout">退出</button>
-          </motion>
-        </motion>
+          </div>
+        </div>
       </header>
       <nav class="tab-strip">
         <button v-for="(n,i) in nav" :key="n" :class="{active: tab===i}" @click="tab=i">{{ n }}</button>
@@ -914,12 +992,21 @@ createApp({
       <main class="harbor-main">
         <p v-if="actionErr" class="action-err">{{ actionErr }}</p>
         <p v-if="actionOk" class="ok-msg">{{ actionOk }}</p>
-        <component :is="{ template: viewMap[tab] }" />
+        <div v-show="tab===0">${dashboardViewTemplate}</div>
+        <div v-show="tab===1">${bridgesViewTemplate}</div>
+        <div v-show="tab===2">${lanesViewTemplate}</div>
+        <div v-show="tab===3">${ticketsViewTemplate}</div>
+        <div v-show="tab===4">${overloadViewTemplate}</div>
+        <div v-show="tab===5">${gateViewTemplate}</div>
+        <div v-show="tab===6">${sealViewTemplate}</div>
+        <div v-show="tab===7">${blViewTemplate}</div>
+        <div v-show="tab===8">${lineageViewTemplate}</div>
+        <div v-show="tab===9">${reconcileViewTemplate}</div>
+        <div v-show="tab===10">${stubsViewTemplate}</div>
       </main>
-    </motion>
+    </div>
   `,
-}).mount("#app");
-"""
+}).mount("#app");"""
 
 # Fix typos in APP_JS template - motion/UploadLogin should be div
 APP_JS = APP_JS.replace("<motion", "<div").replace("</motion>", "</div>").replace("UploadLogin", "div")
@@ -928,7 +1015,7 @@ LANES = r"""
 export const lanesViewTemplate = `
 <section class="panel">
   <h2>过磅车道</h2>
-  <p class="hint">每车道配置超限阈值与旁路引用；进闸方向与出闸方向分开编码。</p>
+  <p class="hint">每车道配置超限阈值与旁路引用；“有据放行/偏航”与放行页同源，均按岸桥计划泊位行核。</p>
   <div class="form-row">
     <div><label>车道编码</label><input v-model="laneForm.lane_code"/></div>
     <div><label>所属地磅</label>
@@ -945,7 +1032,7 @@ export const lanesViewTemplate = `
     <button class="secondary" @click="refresh">刷新</button>
   </div>
   <table class="data-table">
-    <thead><tr><th>车道</th><th>地磅</th><th>方向</th><th>阈值</th><th>旁路</th><th>状态</th></tr></thead>
+    <thead><tr><th>车道</th><th>地磅</th><th>方向</th><th>阈值</th><th>旁路</th><th>有据放行</th><th>偏航</th><th>状态</th></tr></thead>
     <tbody>
       <tr v-for="l in lanes" :key="l.id">
         <td>{{ l.lane_code }}</td>
@@ -953,12 +1040,17 @@ export const lanesViewTemplate = `
         <td>{{ l.direction }}</td>
         <td>{{ l.overload_threshold_t }}t</td>
         <td>{{ l.side_lane_ref || '—' }}</td>
+        <td>{{ l.released_backed ?? 0 }}</td>
+        <td>
+          <span :class="l.released_unbacked ? 'badge fail' : 'badge muted'">{{ l.released_unbacked ?? 0 }}</span>
+        </td>
         <td><span class="badge pass">{{ l.status }}</span></td>
       </tr>
     </tbody>
   </table>
 </section>
-`;"""
+`;
+"""
 
 RECON = RECON.replace("<motion class", "<div class").replace("</motion>", "</div>")
 

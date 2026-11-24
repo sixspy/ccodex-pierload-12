@@ -64,12 +64,18 @@ def test_weigh_overload_gate_seal_flow():
     )
     assert close.status_code == 200
     assert close.json()["ticket_adjudicated"] is True
+    crane = c.post(
+        "/api/crane-stub",
+        headers=h,
+        json={"ticket_id": ticket["id"], "berth_slot": "B-07"},
+    )
+    assert crane.status_code == 200
     gate = c.post(
         "/api/gate/release",
         headers=h,
         json={"ticket_id": ticket["id"], "officer": "验收员"},
     )
-    assert gate.status_code == 200
+    assert gate.status_code == 200, gate.text
     seal = c.post("/api/seals", headers=h, json={"ticket_id": ticket["id"]})
     assert seal.status_code == 200
     assert seal.json()["generation"] == 2
@@ -165,6 +171,11 @@ def test_seal_bumps_generation():
         },
     ).json()
     assert ticket["status"] == "已裁定"
+    c.post(
+        "/api/crane-stub",
+        headers=h,
+        json={"ticket_id": ticket["id"], "berth_slot": "B-07"},
+    )
     c.post(
         "/api/gate/release",
         headers=h,

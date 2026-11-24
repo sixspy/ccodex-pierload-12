@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS gate_releases(
   status TEXT NOT NULL,
   officer TEXT NOT NULL,
   released_at TEXT NOT NULL,
+  crane_job_id INTEGER,
+  crane_berth_slot TEXT,
   FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id),
   FOREIGN KEY(lane_id) REFERENCES weigh_lanes(id)
 );
@@ -353,6 +355,34 @@ def seed_bl_manifests(conn: sqlite3.Connection) -> None:
         )
 
 
+def seed_crane_plans(conn: sqlite3.Connection) -> None:
+    for row in _load_json("crane_plans.json"):
+        ticket = conn.execute(
+            "SELECT id FROM weigh_tickets WHERE ticket_code=?", (row["ticket_code"],)
+        ).fetchone()
+        if not ticket:
+            continue
+        exists = conn.execute(
+            """SELECT id FROM crane_plan_jobs WHERE ticket_id=? AND berth_slot=?
+               AND status NOT IN ('已取消','作废')""",
+            (ticket["id"], row["berth_slot"]),
+        ).fetchone()
+        if exists:
+            continue
+        conn.execute(
+            """INSERT INTO crane_plan_jobs(ticket_id,berth_slot,mode,status,detail,created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (
+                ticket["id"],
+                row["berth_slot"],
+                row.get("mode", "schedule"),
+                row.get("status", "已排程"),
+                row.get("detail", "岸桥计划泊位行"),
+                row.get("created_at", now_iso()),
+            ),
+        )
+
+
 def seed_gate_samples(conn: sqlite3.Connection) -> None:
     for row in _load_json("gate_releases.json"):
         ticket = conn.execute(
@@ -365,9 +395,17 @@ def seed_gate_samples(conn: sqlite3.Connection) -> None:
             "SELECT id FROM gate_releases WHERE release_ref=?", (row["release_ref"],)
         ).fetchone():
             continue
+        job = conn.execute(
+            """SELECT id, berth_slot FROM crane_plan_jobs
+               WHERE ticket_id=? AND status NOT IN ('已取消','作废')
+                 AND TRIM(COALESCE(berth_slot,'')) <> ''
+               ORDER BY id DESC LIMIT 1""",
+            (ticket["id"],),
+        ).fetchone()
         conn.execute(
-            """INSERT INTO gate_releases(ticket_id,lane_id,release_ref,status,officer,released_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO gate_releases(ticket_id,lane_id,release_ref,status,officer,
+               released_at,crane_job_id,crane_berth_slot)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (
                 ticket["id"],
                 ticket["lane_id"],
@@ -375,6 +413,8 @@ def seed_gate_samples(conn: sqlite3.Connection) -> None:
                 row.get("status", "已放行"),
                 row.get("officer", "闸口员"),
                 row["released_at"],
+                job["id"] if job else None,
+                job["berth_slot"] if job else None,
             ),
         )
 
@@ -436,15 +476,38 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列：岸桥禁放第12号的晋升凭证（crane_job_id / crane_berth_slot）。"""
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(gate_releases)").fetchall()
+    }
+    if "crane_job_id" not in cols:
+        conn.execute("ALTER TABLE gate_releases ADD COLUMN crane_job_id INTEGER")
+    if "crane_berth_slot" not in cols:
+        conn.execute("ALTER TABLE gate_releases ADD COLUMN crane_berth_slot TEXT")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_crane_jobs_ticket
+           ON crane_plan_jobs(ticket_id)"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_gate_releases_ticket
+           ON gate_releases(ticket_id)"""
+    )
+    # 存量正式行不回填：无晋升凭证一律留作“偏航未晋升”，不得改写或伪造补录。
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed_users(conn)
         seed_bridges(conn)
         seed_lanes(conn)
         seed_bl_manifests(conn)
         seed_tickets(conn)
         seed_overloads(conn)
+        seed_crane_plans(conn)
         seed_gate_samples(conn)
         seed_seals_sample(conn)
         seed_lineage_samples(conn)
@@ -452,15 +515,24 @@ def init_db() -> None:
 
 
 def dashboard_stats(conn: sqlite3.Connection) -> dict:
+    from crane_gate import BAN_CODE, release_backed
+
     bridges = conn.execute("SELECT COUNT(*) c FROM weigh_bridges").fetchone()["c"]
     lanes = conn.execute("SELECT COUNT(*) c FROM weigh_lanes").fetchone()["c"]
     tickets = conn.execute("SELECT COUNT(*) c FROM weigh_tickets").fetchone()["c"]
     open_holds = conn.execute(
         "SELECT COUNT(*) c FROM overload_holds WHERE status='开放'"
     ).fetchone()["c"]
-    released = conn.execute(
-        "SELECT COUNT(*) c FROM gate_releases WHERE status='已放行'"
-    ).fetchone()["c"]
+    release_rows = conn.execute(
+        """SELECT g.*, j.id AS crane_job_found,
+                  j.berth_slot AS release_berth_slot, j.status AS release_job_status
+           FROM gate_releases g
+           LEFT JOIN crane_plan_jobs j ON j.id=g.crane_job_id
+           WHERE g.status='已放行'"""
+    ).fetchall()
+    # 正式册只计有岸桥计划晋升凭证的行；无凭证一律进偏航计数。
+    released = sum(1 for r in release_rows if release_backed(r))
+    release_anomalies = len(release_rows) - released
     sealed = conn.execute(
         "SELECT COUNT(*) c FROM gate_seals WHERE status='已封闸'"
     ).fetchone()["c"]
@@ -483,9 +555,11 @@ def dashboard_stats(conn: sqlite3.Connection) -> dict:
         "tickets": tickets,
         "open_overloads": open_holds,
         "gate_releases": released,
+        "gate_release_anomalies": release_anomalies,
         "gate_seals": sealed,
         "bl_manifests": bl_count,
         "side_pending": pending,
         "stubs": stubs,
+        "ban_code": BAN_CODE,
         "meta": PRODUCT_META,
     }

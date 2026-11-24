@@ -7,7 +7,8 @@ export const dashboardViewTemplate = `
     <div class="hero-card"><span class="t">开放超重</span><div class="n">{{ dash.open_overloads ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">旁路挂起</span><div class="n">{{ dash.side_pending ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">过磅票</span><div class="n">{{ dash.tickets ?? '—' }}</div></div>
-    <div class="hero-card"><span class="t">已放行</span><div class="n">{{ dash.gate_releases ?? '—' }}</div></div>
+    <div class="hero-card"><span class="t">已放行（正式）</span><div class="n">{{ dash.gate_releases ?? '—' }}</div></div>
+    <div class="hero-card"><span class="t">放行偏航</span><div class="n">{{ dash.gate_release_anomalies ?? '—' }}</div></div>
     <div class="hero-card"><span class="t">已封闸</span><div class="n">{{ dash.gate_seals ?? '—' }}</div></div>
   </div>
   <p class="hint" style="margin-top:16px">骨架：{{ dash.meta && dash.meta.skeleton }}</p>

@@ -6,6 +6,7 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
+from crane_gate import BAN_CODE, annotate_tickets, state_for_ticket
 from db import connect, now_iso, write_audit
 from locks import release, require_lock
 from models import TicketIn
@@ -49,7 +50,8 @@ def list_tickets(authorization: AuthHeader = None, status: str | None = None):
             d = dict(r)
             d["axle_weights"] = json.loads(d["axle_weights"] or "[]")
             items.append(d)
-        return {"items": items}
+        annotate_tickets(conn, items)
+        return {"items": items, "ban_code": BAN_CODE}
 
 
 @router.get("/api/tickets/{ticket_id}")
@@ -85,6 +87,8 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
             "overload_holds": [dict(h) for h in holds],
             "gate_seals": [dict(s) for s in seals],
             "gate_releases": [dict(r) for r in releases],
+            "release_state": state_for_ticket(conn, ticket_id),
+            "ban_code": BAN_CODE,
         }
 
 

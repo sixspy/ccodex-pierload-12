@@ -48,6 +48,31 @@ def require_lock(conn, lock_key: str, holder: str) -> None:
         raise HTTPException(409, "争用：后到只记争用，不写业务")
 
 
+def claim_lock(conn, lock_key: str, holder: str) -> bool:
+    """占用型闸口锁：一次写定，败方只记争用痕（不写业务）。
+
+    闸口锁为占用锁，成功后不释放——同票第二次抬杆只能看到占用者，
+    从而稳定落到“争用”而不是被票态兜底成“已放行”。
+    """
+    now = now_iso()
+    cur = conn.execute(
+        """INSERT INTO pier_locks(lock_key,holder,acquired_at) VALUES (?,?,?)
+           ON CONFLICT(lock_key) DO NOTHING""",
+        (lock_key, holder, now),
+    )
+    if cur.rowcount == 1:
+        return True
+    row = conn.execute(
+        "SELECT holder FROM pier_locks WHERE lock_key=?", (lock_key,)
+    ).fetchone()
+    conn.execute(
+        """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
+           VALUES (?,?,?,?,?)""",
+        (lock_key, holder, "争用", f"持有者={row['holder'] if row else '?'}", now),
+    )
+    return False
+
+
 @router.get("/api/locks")
 def list_locks(authorization: AuthHeader = None):
     require_user(authorization)

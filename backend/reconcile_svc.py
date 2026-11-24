@@ -1,9 +1,14 @@
-"""提单册与过磅票对账证明。"""
+"""提单册与过磅票对账证明。
+
+唯一口径由 `crane_gate.state_for_ticket` 给出：无岸桥计划支撑的正式行
+（或没有晋升凭证的历史行）只能呈现为“偏航未晋升”，不得标为已放行。
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
+from crane_gate import BAN_CODE, crane_plan_ready, state_for_ticket
 from validators import validate_bl_match
 
 router = APIRouter(tags=["reconcile"])
@@ -21,7 +26,7 @@ def reconcile_all(authorization: AuthHeader = None):
         items = []
         for bl in rows:
             items.append(_reconcile_bl(conn, bl["bl_code"]))
-        return {"items": items}
+        return {"items": items, "ban_code": BAN_CODE}
 
 
 @router.get("/api/reconcile/{bl_code}")
@@ -43,7 +48,7 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "SELECT * FROM bl_manifests WHERE bl_code=?", (bl_code,)
     ).fetchone()
     tickets = conn.execute(
-        """SELECT ticket_code, gross_t, status, generation FROM weigh_tickets
+        """SELECT id, ticket_code, gross_t, status, generation FROM weigh_tickets
            WHERE bl_ref=? AND status NOT IN ('作废')""",
         (bl_code,),
     ).fetchall()
@@ -55,6 +60,7 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
             "balanced": False,
             "reason": "无过磅票",
             "tickets": [],
+            "ban_code": BAN_CODE,
         }
     ticket_sum = round(sum(float(t["gross_t"]) for t in tickets), 3)
     declared = float(bl["declared_gross_t"])
@@ -65,7 +71,19 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
            WHERE t.bl_ref=?""",
         (bl_code,),
     ).fetchall()
-    proof_ok = matched and len(seal_rows) >= 1
+    items = []
+    for t in tickets:
+        row = {
+            "ticket_code": t["ticket_code"],
+            "gross_t": t["gross_t"],
+            "status": t["status"],
+            "generation": t["generation"],
+        }
+        row.update(state_for_ticket(conn, int(t["id"])))
+        items.append(row)
+    released_backed = [x for x in items if x["released"]]
+    unbacked = [x for x in items if x["release_ref"] and not x["released"]]
+    proof_ok = matched and len(seal_rows) >= 1 and not unbacked
     return {
         "bl_code": bl_code,
         "declared_gross_t": declared,
@@ -73,8 +91,11 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "balanced": matched,
         "proof_ready": proof_ok,
         "seal_count": len(seal_rows),
-        "tickets": [dict(t) for t in tickets],
+        "released_count": len(released_backed),
+        "unpromoted_count": len(unbacked),
+        "tickets": items,
         "seals": [dict(s) for s in seal_rows],
+        "ban_code": BAN_CODE,
     }
 
 
@@ -96,10 +117,8 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             """SELECT * FROM gate_seals WHERE ticket_id=? ORDER BY id DESC LIMIT 1""",
             (ticket["id"],),
         ).fetchone()
-        release = conn.execute(
-            """SELECT * FROM gate_releases WHERE ticket_id=? AND status='已放行'""",
-            (ticket["id"],),
-        ).fetchone()
+        release_state = state_for_ticket(conn, int(ticket["id"]))
+        plan = crane_plan_ready(conn, int(ticket["id"]))
         overload_closed = not conn.execute(
             """SELECT id FROM overload_holds WHERE ticket_id=? AND status='开放'""",
             (ticket["id"],),
@@ -116,9 +135,16 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             "manifest_matches_bl": manifest_match,
             "has_seal": seal is not None,
             "seal_generation": seal["ticket_generation"] if seal else None,
-            "released": release is not None,
+            "released": release_state["released"],
+            "release_state": release_state["release_state"],
+            "release_register": release_state["release_register"],
+            "release_ref": release_state["release_ref"],
+            "crane_plan_ready": plan["ready"],
+            "crane_job_id": plan["job_id"],
+            "crane_berth_slot": plan["berth_slot"],
+            "ban_code": BAN_CODE,
             "overload_closed": overload_closed,
             "coherent": bool(
-                manifest_match and overload_closed and (seal or release)
+                manifest_match and overload_closed and (seal or release_state["released"])
             ),
         }

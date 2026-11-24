@@ -31,11 +31,14 @@ createApp({
     const tickets = ref([]);
     const overloads = ref([]);
     const gateReleases = ref([]);
+    const gateReleasable = ref([]);
+    const gateBlocked = ref([]);
     const seals = ref([]);
     const blList = ref([]);
     const lineageEdges = ref([]);
     const customsJobs = ref([]);
     const craneJobs = ref([]);
+    const craneUnplanned = ref([]);
     const bridgeDetail = ref(null);
     const ticketDetail = ref(null);
     const reconOne = ref(null);
@@ -80,8 +83,9 @@ createApp({
       tickets.value.filter((t) => t.status !== "作废" && t.status !== "已封闸")
     );
     const releasableTickets = computed(() =>
-      tickets.value.filter((t) => t.status === "已裁定")
+      gateReleasable.value
     );
+    const blockedReleases = computed(() => gateBlocked.value);
     const sealableTickets = computed(() =>
       tickets.value.filter((t) => ["已裁定","已放行"].includes(t.status))
     );
@@ -92,6 +96,7 @@ createApp({
     }
     function ticketClass(s) {
       if (!s) return "muted";
+      if (s.includes("偏航") || s.includes("禁放")) return "fail";
       if (s.includes("挂起")) return "fail";
       if (s.includes("放行") || s.includes("裁定")) return "pass";
       if (s.includes("封闸")) return "warn";
@@ -122,13 +127,13 @@ createApp({
       await refresh();
     }
 
-    async function refresh() {
+    async function refresh(keepFlash = false) {
       if (!token.value) return;
-      clearFlash();
+      if (!keepFlash) clearFlash();
       try {
-        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2] = await Promise.all([
+        const [d, br, ln, tk, ov, gr, grq, sl, bl, lg, cj, cj2] = await Promise.all([
           api.dashboard(), api.bridges(), api.lanes(), api.tickets(), api.overloads(),
-          api.gateReleases(), api.seals(), api.blList(), api.lineage(),
+          api.gateReleases(), api.gateReleasable(), api.seals(), api.blList(), api.lineage(),
           api.customsJobs(), api.craneJobs(),
         ]);
         dash.value = d || {};
@@ -137,11 +142,14 @@ createApp({
         tickets.value = tk.items || [];
         overloads.value = ov.items || [];
         gateReleases.value = gr.items || [];
+        gateReleasable.value = grq.items || [];
+        gateBlocked.value = grq.blocked || [];
         seals.value = sl.items || [];
         blList.value = bl.items || [];
         lineageEdges.value = lg.items || [];
         customsJobs.value = cj.items || [];
         craneJobs.value = cj2.items || [];
+        craneUnplanned.value = cj2.unplanned_releases || [];
         if (bridges.value.length) {
           laneForm.value.bridge_id = laneForm.value.bridge_id || bridges.value[0].id;
         }
@@ -207,8 +215,10 @@ createApp({
       clearFlash();
       try {
         await api.releaseGate(gateForm.value);
-        flashOk("已放行"); await refresh();
-      } catch (e) { flashErr(e); }
+        flashOk("已放行（正式册）"); await refresh(true);
+      } catch (e) {
+        flashErr(e); await refresh(true);
+      }
     }
     async function createSeal() {
       clearFlash();
@@ -261,12 +271,13 @@ createApp({
 
     return {
       token, user, username, password, err, actionErr, actionOk, tab, nav,
-      dash, bridges, lanes, tickets, overloads, gateReleases, seals, blList,
-      lineageEdges, customsJobs, craneJobs, bridgeDetail, ticketDetail,
+      dash, bridges, lanes, tickets, overloads, gateReleases, gateReleasable, gateBlocked,
+      seals, blList, lineageEdges, customsJobs, craneJobs, craneUnplanned,
+      bridgeDetail, ticketDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
       bridgeForm, laneForm, ticketForm, overloadOpenForm, gateForm, sealForm,
       blForm, lineageForm, customsForm, craneForm,
-      adjudicableTickets, releasableTickets, sealableTickets,
+      adjudicableTickets, releasableTickets, blockedReleases, sealableTickets,
       login, logout, refresh,
       fmtT, ticketClass, shortText,
       createBridge, loadBridgeDetail, createLane, createTicket, loadTicketDetail, selectTicket,

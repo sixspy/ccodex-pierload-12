@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
+from crane_gate import BAN_CODE, annotate_tickets, lane_release_summary
 from db import connect, now_iso, write_audit
 from models import LaneIn
 
@@ -14,6 +15,7 @@ router = APIRouter(tags=["lanes"])
 def list_lanes(authorization: AuthHeader = None, bridge_id: int | None = None):
     require_user(authorization)
     with connect() as conn:
+        summary = lane_release_summary(conn)
         if bridge_id:
             rows = conn.execute(
                 """SELECT l.*, b.bridge_code, b.name bridge_name FROM weigh_lanes l
@@ -27,7 +29,15 @@ def list_lanes(authorization: AuthHeader = None, bridge_id: int | None = None):
                    JOIN weigh_bridges b ON b.id=l.bridge_id
                    ORDER BY l.lane_code"""
             ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        items = []
+        for r in rows:
+            d = dict(r)
+            counts = summary.get(int(d["id"]), {})
+            d["released_backed"] = counts.get("released_backed", 0)
+            d["released_unbacked"] = counts.get("released_unbacked", 0)
+            d["ban_code"] = BAN_CODE
+            items.append(d)
+        return {"items": items, "ban_code": BAN_CODE}
 
 
 @router.get("/api/lanes/{lane_id}")
@@ -43,11 +53,20 @@ def get_lane(lane_id: int, authorization: AuthHeader = None):
         if not row:
             raise HTTPException(404, "车道不存在")
         tickets = conn.execute(
-            """SELECT ticket_code, status, gross_t FROM weigh_tickets
-               WHERE lane_id=? ORDER BY id DESC LIMIT 8""",
+            """SELECT t.id, t.ticket_code, t.status, t.gross_t,
+                      t.bl_ref, t.vehicle_plate, t.generation
+               FROM weigh_tickets t
+               WHERE t.lane_id=? ORDER BY t.id DESC LIMIT 8""",
             (lane_id,),
         ).fetchall()
-        return {"lane": dict(row), "recent_tickets": [dict(t) for t in tickets]}
+        counts = lane_release_summary(conn).get(int(lane_id), {})
+        return {
+            "lane": dict(row),
+            "released_backed": counts.get("released_backed", 0),
+            "released_unbacked": counts.get("released_unbacked", 0),
+            "recent_tickets": annotate_tickets(conn, [dict(t) for t in tickets]),
+            "ban_code": BAN_CODE,
+        }
 
 
 @router.post("/api/lanes")

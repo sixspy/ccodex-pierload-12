@@ -29,6 +29,7 @@ export function createApi(getToken, onUnauthorized) {
     openOverload: (d) => req("/api/overloads/open", { method: "POST", body: JSON.stringify(d) }),
     closeOverload: (d) => req("/api/overloads/close", { method: "POST", body: JSON.stringify(d) }),
     gateReleases: () => req("/api/gate/releases"),
+    gateReleasable: () => req("/api/gate/releasable"),
     releaseGate: (d) => req("/api/gate/release", { method: "POST", body: JSON.stringify(d) }),
     seals: () => req("/api/seals"),
     createSeal: (d) => req("/api/seals", { method: "POST", body: JSON.stringify(d) }),
@@ -42,6 +43,7 @@ export function createApi(getToken, onUnauthorized) {
     customsJobs: () => req("/api/customs/jobs"),
     customsStub: (d) => req("/api/customs-stub", { method: "POST", body: JSON.stringify(d) }),
     craneJobs: () => req("/api/crane/jobs"),
+    cranePlan: (ticketId) => req(`/api/crane/plan/${ticketId}`),
     craneStub: (d) => req("/api/crane-stub", { method: "POST", body: JSON.stringify(d) }),
     contention: () => req("/api/contention"),
   };
